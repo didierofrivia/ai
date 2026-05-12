@@ -40,6 +40,11 @@ pub(super) fn validate_host_header(session: &mut Session) -> Option<Rejection> {
         return None;
     };
 
+    if first.as_bytes().iter().all(u8::is_ascii_whitespace) {
+        debug!("rejecting request with empty or whitespace-only Host header");
+        return Some(Rejection::status(400));
+    }
+
     let second = iter.next()?;
 
     if second.as_bytes() != first.as_bytes() {

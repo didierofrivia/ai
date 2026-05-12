@@ -108,9 +108,28 @@ fn empty_host_header_handled_safely() {
     let raw = http_send(proxy.addr(), request);
     let status = parse_status(&raw);
 
-    assert!(
-        status == 200 || status == 400,
-        "empty Host header should be handled safely (got {status})"
+    assert_eq!(
+        status, 400,
+        "empty Host header must be rejected per RFC 9112 Section 3.2"
+    );
+}
+
+#[test]
+fn whitespace_only_host_header_rejected() {
+    let backend_port_guard = start_backend_with_shutdown("ok");
+    let backend_port = backend_port_guard.port();
+    let proxy_port = free_port();
+    let yaml = simple_proxy_yaml(proxy_port, backend_port);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let request = "GET / HTTP/1.1\r\nHost: \t  \r\nConnection: close\r\n\r\n";
+    let raw = http_send(proxy.addr(), request);
+    let status = parse_status(&raw);
+
+    assert_eq!(
+        status, 400,
+        "whitespace-only Host header must be rejected per RFC 9112 Section 3.2"
     );
 }
 
