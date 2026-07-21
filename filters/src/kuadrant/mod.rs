@@ -8,6 +8,7 @@
 
 mod config;
 mod filter;
+mod grpc;
 
 #[cfg(test)]
 mod tests;
