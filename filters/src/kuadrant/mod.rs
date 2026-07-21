@@ -9,4 +9,7 @@
 mod config;
 mod filter;
 
+#[cfg(test)]
+mod tests;
+
 pub use filter::KuadrantFilter;

@@ -5,13 +5,20 @@
 
 use async_trait::async_trait;
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Kuadrant filter for integrating with Authorino and Limitador services.
 ///
 /// This filter uses the kuadrant-filter crate's Pipeline pattern to
 /// orchestrate calls to Kuadrant services based on configuration.
+#[allow(dead_code, reason = "WIP")]
 pub struct KuadrantFilter {
-    // TODO: Add fields for pipeline factory, upstream clients, etc.
+    /// Upstream connection configurations keyed by upstream name.
+    upstreams: Arc<HashMap<String, super::config::UpstreamConfig>>,
+
+    /// Kuadrant plugin configuration (policy engine).
+    kuadrant_config: kuadrant_filter::configuration::PluginConfiguration,
 }
 
 impl KuadrantFilter {
@@ -21,12 +28,21 @@ impl KuadrantFilter {
     ///
     /// Returns [`FilterError`] if config parsing or validation fails.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        // TODO: Parse config, build pipeline factory, create clients
-        let _cfg: super::config::KuadrantFilterConfig =
+        // Parse config from YAML
+        let cfg: super::config::KuadrantFilterConfig =
             praxis_filter::parse_filter_config("kuadrant", config)?;
 
-        // Placeholder implementation
-        Err(FilterError::from("kuadrant filter not yet implemented"))
+        // Validate configuration (check service endpoints reference existing upstreams)
+        cfg.validate()
+            .map_err(|e| FilterError::from(format!("kuadrant config validation failed: {}", e)))?;
+
+        // Consume config to extract upstreams and kuadrant_config without cloning
+        let (upstreams, kuadrant_config) = cfg.into_parts();
+
+        Ok(Box::new(Self {
+            upstreams: Arc::new(upstreams),
+            kuadrant_config,
+        }))
     }
 }
 
