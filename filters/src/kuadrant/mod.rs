@@ -7,6 +7,7 @@
 //! using the kuadrant-filter crate for configuration and orchestration.
 
 mod config;
+mod context;
 mod filter;
 mod grpc;
 
