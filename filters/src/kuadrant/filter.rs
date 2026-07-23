@@ -123,22 +123,63 @@ impl HttpFilter for KuadrantFilter {
             }
         };
 
-        debug!("kuadrant filter: evaluating pipeline");
+        debug!(
+            requires_pause = pipeline.requires_pause(),
+            is_terminated = pipeline.is_terminated(),
+            "kuadrant filter: pipeline built, about to evaluate"
+        );
 
-        // Evaluate the pipeline (same as wasm-shim)
-        let state = pipeline.eval();
+        // Evaluate the pipeline until completion
+        // In WASM this is async with callbacks, but we block on gRPC calls
+        // so we need to keep evaluating until the pipeline completes
+        let mut pipeline = pipeline;
+        let mut iteration = 0;
+        let final_state = loop {
+            iteration += 1;
 
-        match state {
-            kuadrant_filter::kuadrant::pipeline::PipelineState::InProgress(_) => {
-                debug!("kuadrant filter: pipeline in progress (async work pending)");
-                // TODO: Handle async/deferred tasks (store pipeline, wait for gRPC responses)
-                Ok(FilterAction::Continue)
+            if iteration > 10 {
+                return Err(FilterError::from(format!(
+                    "kuadrant pipeline evaluation exceeded max iterations (stuck in loop). \
+                     This likely means dispatch_grpc_call is not being called. \
+                     The pipeline may be waiting for an attribute or method we haven't implemented."
+                )));
             }
-            kuadrant_filter::kuadrant::pipeline::PipelineState::Completed { should_resume } => {
-                debug!(should_resume, "kuadrant filter: pipeline completed");
-                // TODO: Check if request was denied/rate-limited
-                Ok(FilterAction::Continue)
+
+            debug!(
+                iteration,
+                requires_pause = pipeline.requires_pause(),
+                is_terminated = pipeline.is_terminated(),
+                "kuadrant filter: evaluating pipeline iteration"
+            );
+
+            let state = pipeline.eval();
+
+            match state {
+                kuadrant_filter::kuadrant::pipeline::PipelineState::InProgress(p) => {
+                    debug!(
+                        iteration,
+                        requires_pause = p.requires_pause(),
+                        is_terminated = p.is_terminated(),
+                        "kuadrant filter: pipeline in progress, continuing evaluation"
+                    );
+                    pipeline = *p;
+                    // Loop continues to evaluate again
+                }
+                kuadrant_filter::kuadrant::pipeline::PipelineState::Completed { should_resume } => {
+                    debug!(should_resume, iteration, "kuadrant filter: pipeline completed");
+                    break should_resume;
+                }
             }
+        };
+
+        // Check if the request should proceed
+        if final_state {
+            debug!("kuadrant filter: request allowed");
+            Ok(FilterAction::Continue)
+        } else {
+            debug!("kuadrant filter: request denied by policy");
+            // TODO: Extract proper status code and response from pipeline
+            Err(FilterError::from("Request denied by Kuadrant policy"))
         }
     }
 }
