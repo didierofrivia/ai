@@ -115,19 +115,25 @@ impl AttributeResolver for PraxisAttributeResolver {
     // ========================================================================
 
     fn get_attribute(&self, path: &Path) -> Result<Option<Vec<u8>>, AttributeError> {
+        use tracing::debug;
+
         // Map Envoy-style attribute paths to Praxis request data
         let path_str = path.to_string();
 
-        match path_str.as_str() {
+        let result = match path_str.as_str() {
             "request.host" => {
                 // Extract host from URI or Host header
                 if let Some(host) = self.request_data.uri.host() {
-                    return Ok(Some(host.as_bytes().to_vec()));
+                    Ok(Some(host.as_bytes().to_vec()))
+                } else if let Some(host) = self.request_data.headers.get(http::header::HOST) {
+                    // Validate UTF-8 for header value
+                    let host_str = host
+                        .to_str()
+                        .map_err(|_| AttributeError::Retrieval("Host header contains invalid UTF-8".to_string()))?;
+                    Ok(Some(host_str.as_bytes().to_vec()))
+                } else {
+                    Ok(None)
                 }
-                if let Some(host) = self.request_data.headers.get(http::header::HOST) {
-                    return Ok(Some(host.as_bytes().to_vec()));
-                }
-                Ok(None)
             }
             "request.method" => {
                 Ok(Some(self.request_data.method.as_str().as_bytes().to_vec()))
@@ -136,11 +142,45 @@ impl AttributeResolver for PraxisAttributeResolver {
                 Ok(Some(self.request_data.uri.path().as_bytes().to_vec()))
             }
             "request.scheme" => {
-                if let Some(scheme) = self.request_data.uri.scheme_str() {
-                    Ok(Some(scheme.as_bytes().to_vec()))
-                } else {
-                    Ok(None)
-                }
+                // Return scheme from URI or default to "http"
+                let scheme = self.request_data.uri.scheme_str().unwrap_or("http");
+                Ok(Some(scheme.as_bytes().to_vec()))
+            }
+            "request.time" => {
+                // Return timestamp as i64 nanoseconds (8 bytes little-endian)
+                use std::time::SystemTime;
+
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_err(|e| AttributeError::Retrieval(format!("time error: {}", e)))?;
+
+                let nanos = now.as_secs() as i64 * 1_000_000_000 + now.subsec_nanos() as i64;
+                Ok(Some(nanos.to_le_bytes().to_vec()))
+            }
+            "request.protocol" => {
+                // HTTP version as UTF-8 string (required field)
+                Ok(Some(b"HTTP/1.1".to_vec()))
+            }
+            "destination.address" => {
+                // TODO: Extract from connection metadata
+                // Address is a UTF-8 string "ip:port"
+                Ok(Some(b"127.0.0.1".to_vec()))
+            }
+            "destination.port" => {
+                // TODO: Extract from connection metadata
+                // Port as i64 (8 bytes little-endian)
+                let port: i64 = 8080;
+                Ok(Some(port.to_le_bytes().to_vec()))
+            }
+            "source.address" => {
+                // TODO: Extract from connection metadata
+                Ok(Some(b"127.0.0.1".to_vec()))
+            }
+            "source.port" => {
+                // TODO: Extract from connection metadata
+                // Port as i64 (8 bytes little-endian)
+                let port: i64 = 45000;
+                Ok(Some(port.to_le_bytes().to_vec()))
             }
             _ => {
                 // Unsupported attribute
@@ -149,11 +189,44 @@ impl AttributeResolver for PraxisAttributeResolver {
                     path_str
                 )))
             }
+        };
+
+        // Log the result for debugging
+        match &result {
+            Ok(Some(bytes)) => {
+                match std::str::from_utf8(bytes) {
+                    Ok(s) => debug!(path = %path_str, value = %s, bytes_len = bytes.len(), hex = ?bytes, "get_attribute -> UTF-8 string"),
+                    Err(_) if bytes.len() == 8 => {
+                        let value = i64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]);
+                        debug!(path = %path_str, value = value, hex = ?bytes, "get_attribute -> i64");
+                    }
+                    Err(_) => debug!(path = %path_str, bytes = ?bytes, "get_attribute -> INVALID UTF-8"),
+                }
+            }
+            Ok(None) => debug!(path = %path_str, "get_attribute -> None"),
+            Err(e) => debug!(path = %path_str, error = %e, "get_attribute -> Error"),
         }
+
+        result
     }
 
     fn get_request_headers(&self) -> Result<Vec<(String, String)>, AttributeError> {
-        todo!("get_request_headers")
+        // Convert HeaderMap to Vec<(String, String)>
+        let headers: Vec<(String, String)> = self
+            .request_data
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                let name_str = name.as_str().to_string();
+                let value_str = value
+                    .to_str()
+                    .unwrap_or("")
+                    .to_string();
+                (name_str, value_str)
+            })
+            .collect();
+
+        Ok(headers)
     }
 
     // ========================================================================
@@ -161,27 +234,49 @@ impl AttributeResolver for PraxisAttributeResolver {
     // ========================================================================
 
     fn get_response_headers(&self) -> Result<Vec<(String, String)>, AttributeError> {
-        todo!("get_response_headers")
+        use tracing::debug;
+        debug!("get_response_headers called (returning empty - not in response phase)");
+        // Not in response phase yet, return empty
+        Ok(Vec::new())
     }
 
-    fn get_request_header_value(&self, _key: &str) -> Result<Option<String>, AttributeError> {
-        todo!("get_request_header_value")
+    fn get_request_header_value(&self, key: &str) -> Result<Option<String>, AttributeError> {
+        // Look up header by name (case-insensitive)
+        match self.request_data.headers.get(key) {
+            Some(value) => {
+                let value_str = value
+                    .to_str()
+                    .map_err(|e| AttributeError::Retrieval(format!("invalid header value: {}", e)))?
+                    .to_string();
+                Ok(Some(value_str))
+            }
+            None => Ok(None),
+        }
     }
 
-    fn set_attribute(&self, _path: &Path, _value: &[u8]) -> Result<(), AttributeError> {
-        todo!("set_attribute")
+    fn set_attribute(&self, path: &Path, _value: &[u8]) -> Result<(), AttributeError> {
+        use tracing::debug;
+        debug!(path = %path, "set_attribute called (no-op)");
+        // No-op for now - we don't need to store attributes in the request phase
+        Ok(())
     }
 
     // ========================================================================
     // Response headers
     // ========================================================================
 
-    fn set_request_headers(&self, _headers: Vec<(&str, &str)>) -> Result<(), AttributeError> {
-        todo!("set_request_headers")
+    fn set_request_headers(&self, headers: Vec<(&str, &str)>) -> Result<(), AttributeError> {
+        use tracing::debug;
+        debug!(?headers, "set_request_headers called (no-op)");
+        // No-op - we can't modify request headers after building the resolver
+        Ok(())
     }
 
-    fn set_response_headers(&self, _headers: Vec<(&str, &str)>) -> Result<(), AttributeError> {
-        todo!("set_response_headers")
+    fn set_response_headers(&self, headers: Vec<(&str, &str)>) -> Result<(), AttributeError> {
+        use tracing::debug;
+        debug!(?headers, "set_response_headers called (no-op)");
+        // No-op - not in response phase yet
+        Ok(())
     }
 
     // ========================================================================
@@ -190,10 +285,13 @@ impl AttributeResolver for PraxisAttributeResolver {
 
     fn get_http_request_body(
         &self,
-        _start: usize,
-        _size: usize,
+        start: usize,
+        size: usize,
     ) -> Result<Option<Vec<u8>>, AttributeError> {
-        todo!("get_http_request_body")
+        use tracing::debug;
+        debug!(start, size, "get_http_request_body called (returning None - body not buffered)");
+        // We don't buffer the request body in this POC
+        Ok(None)
     }
 
     // ========================================================================
@@ -202,10 +300,13 @@ impl AttributeResolver for PraxisAttributeResolver {
 
     fn get_http_response_body(
         &self,
-        _start: usize,
-        _size: usize,
+        start: usize,
+        size: usize,
     ) -> Result<Option<Vec<u8>>, AttributeError> {
-        todo!("get_http_response_body")
+        use tracing::debug;
+        debug!(start, size, "get_http_response_body called (returning None - not in response phase)");
+        // Not in response phase yet
+        Ok(None)
     }
 
     // ========================================================================
@@ -221,11 +322,30 @@ impl AttributeResolver for PraxisAttributeResolver {
         message: Vec<u8>,
         timeout: Duration,
     ) -> Result<u32, ServiceError> {
+        use tracing::debug;
+
+        debug!(
+            upstream = upstream,
+            service = service,
+            method = method,
+            message_len = message.len(),
+            "kuadrant: dispatching gRPC call"
+        );
+
+        // Debug: log the protobuf message bytes (full message for inspection)
+        debug!(
+            message_bytes = ?&message,
+            total_len = message.len(),
+            "kuadrant: protobuf message to send"
+        );
+
         // Get upstream config
         let upstream_config = self
             .upstreams
             .get(upstream)
             .ok_or_else(|| ServiceError::Dispatch(format!("upstream '{}' not found", upstream)))?;
+
+        debug!(url = upstream_config.url(), "kuadrant: connecting to upstream");
 
         // Get or create Channel (async operation)
         let channel = tokio::task::block_in_place(|| {
@@ -240,12 +360,23 @@ impl AttributeResolver for PraxisAttributeResolver {
             })
         })?;
 
+        debug!("kuadrant: making gRPC call");
+
+        // Debug: log the protobuf message bytes (full message for inspection)
+        debug!(
+            message_bytes = ?&message,
+            total_len = message.len(),
+            "TEST: kuadrant: protobuf message to send"
+            );
+
         // Make gRPC call (async operation)
         let response = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 grpc_call(channel, service, method, message, timeout).await
             })
         })?;
+
+        debug!(response_size = response.len(), "kuadrant: gRPC call successful");
 
         // Store response and return token
         let token = self
@@ -254,16 +385,27 @@ impl AttributeResolver for PraxisAttributeResolver {
             .expect("response store lock poisoned")
             .store(response);
 
+        debug!(token = token, "kuadrant: stored response with token");
+
         Ok(token)
     }
 
-    fn get_grpc_response(&self, _size: usize) -> Result<Vec<u8>, ServiceError> {
+    fn get_grpc_response(&self, size: usize) -> Result<Vec<u8>, ServiceError> {
+        use tracing::debug;
+
+        debug!(size, "kuadrant: retrieving gRPC response");
+
         // Get last stored response
-        self.response_store
+        let response = self
+            .response_store
             .write()
             .expect("response store lock poisoned")
             .get_last()
-            .ok_or_else(|| ServiceError::Retrieval("no response available".to_string()))
+            .ok_or_else(|| ServiceError::Retrieval("no response available".to_string()))?;
+
+        debug!(response_size = response.len(), "kuadrant: retrieved gRPC response");
+
+        Ok(response)
     }
 
     // ========================================================================
@@ -272,11 +414,14 @@ impl AttributeResolver for PraxisAttributeResolver {
 
     fn send_http_reply(
         &self,
-        _status_code: u32,
-        _headers: Vec<(&str, &str)>,
-        _body: Option<&[u8]>,
+        status_code: u32,
+        headers: Vec<(&str, &str)>,
+        body: Option<&[u8]>,
     ) -> Result<(), ServiceError> {
-        todo!("send_http_reply")
+        use tracing::debug;
+        debug!(status_code, ?headers, body_len = body.map(|b| b.len()), "send_http_reply called");
+        // TODO: Store this to return as the actual HTTP response
+        Ok(())
     }
 }
 
