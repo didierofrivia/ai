@@ -37,6 +37,9 @@ rcgen = "0.14.8"
 regex = "1.12.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rmcp = { version = "2.0.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
+tonic = { version = "0.12", default-features = false, features = ["transport", "tls", "tls-roots", "prost"] }
+prost = "0.13"
+prost-types = "0.13"
 rustls = "0.23.41"
 rustls-pemfile = "2.2.0"
 secrecy = { version = "0.10.3", features = ["serde"] }
@@ -52,10 +55,14 @@ tokio = { version = "1.52.3", features = ["macros", "rt"] }
 tokio-rustls = "0.26.4"
 tokio-tungstenite = "0.30.0"
 tokio-util = "0.7.18"
+tower = "0.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 wiremock = "0.6.5"
 zeroize = "1.9.0"
+
+# Kuadrant filter dependency
+kuadrant-filter = { git = "https://github.com/didierofrivia/wasm-shim.git", rev = "85fb7691edff3fcc6f9a03ff9804d27a382becb4", features = ["threadsafe"] }
 
 # Praxis core dependencies
 praxis-core = { version = "0.4.0", package = "praxis-proxy-core", features = ["callout"] }
