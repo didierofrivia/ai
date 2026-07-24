@@ -2357,7 +2357,7 @@ dependencies = [
 [[package]]
 name = "kuadrant-filter"
 version = "0.13.0-dev"
-source = "git+https://github.com/didierofrivia/wasm-shim.git?rev=85fb7691edff3fcc6f9a03ff9804d27a382becb4#85fb7691edff3fcc6f9a03ff9804d27a382becb4"
+source = "git+https://github.com/didierofrivia/wasm-shim.git?rev=77d9019e28ef66d5827ce64593cc5f767fdef378#77d9019e28ef66d5827ce64593cc5f767fdef378"
 dependencies = [
  "acutejson",
  "cel 0.13.0 (git+https://github.com/cel-rust/cel-rust.git?rev=d23d0a7)",
