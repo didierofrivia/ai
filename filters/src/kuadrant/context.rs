@@ -93,6 +93,29 @@ struct RequestData {
     method: http::Method,
     uri: http::Uri,
     headers: http::HeaderMap,
+    client_addr: Option<std::net::IpAddr>,
+    upstream_addr: Option<std::net::SocketAddr>,
+    // Note: client port is extracted from IpAddr.to_string() via parse_ip_and_port(),
+    // which handles "IP:PORT" format or defaults to port 80
+}
+
+/// Parse IP address and port from IpAddr.
+///
+/// IpAddr.to_string() might return "IP:PORT" or just "IP".
+/// Returns (ip_string, port), defaulting to port 80 if not present.
+fn parse_ip_and_port(addr: std::net::IpAddr) -> (String, u16) {
+    let addr_str = addr.to_string();
+
+    if let Some(colon_pos) = addr_str.rfind(':') {
+        // Found colon - might be "IP:PORT" format
+        let ip_part = addr_str[..colon_pos].to_string();
+        let port_str = &addr_str[colon_pos + 1..];
+        let port = port_str.parse::<u16>().unwrap_or(80);
+        (ip_part, port)
+    } else {
+        // No colon - just the IP, default to port 80
+        (addr_str, 80)
+    }
 }
 
 /// Praxis implementation of kuadrant-filter's AttributeResolver trait.
@@ -132,6 +155,8 @@ impl PraxisAttributeResolver {
             method: ctx.request.method.clone(),
             uri: ctx.request.uri.clone(),
             headers: ctx.request.headers.clone(),
+            client_addr: ctx.client_addr,
+            upstream_addr: ctx.upstream.as_ref().and_then(|u| u.address.parse().ok()),
         });
 
         Self {
@@ -196,25 +221,39 @@ impl AttributeResolver for PraxisAttributeResolver {
                 Ok(Some(b"HTTP/1.1".to_vec()))
             }
             "destination.address" => {
-                // TODO: Extract from connection metadata
-                // Address is a UTF-8 string "ip:port"
-                Ok(Some(b"127.0.0.1".to_vec()))
+                // Extract from upstream backend address (SocketAddr from load_balancer)
+                let addr = self.request_data.upstream_addr
+                    .ok_or_else(|| AttributeError::NotAvailable(
+                        "destination.address not available: upstream is None".to_string()
+                    ))?;
+                Ok(Some(addr.ip().to_string().as_bytes().to_vec()))
             }
             "destination.port" => {
-                // TODO: Extract from connection metadata
-                // Port as i64 (8 bytes little-endian)
-                let port: i64 = 8080;
-                Ok(Some(port.to_le_bytes().to_vec()))
+                // Extract port from upstream backend address (SocketAddr from load_balancer)
+                let addr = self.request_data.upstream_addr
+                    .ok_or_else(|| AttributeError::NotAvailable(
+                        "destination.port not available: upstream is None".to_string()
+                    ))?;
+                let port_i64 = addr.port() as i64;
+                Ok(Some(port_i64.to_le_bytes().to_vec()))
             }
             "source.address" => {
-                // TODO: Extract from connection metadata
-                Ok(Some(b"127.0.0.1".to_vec()))
+                // Extract from client_addr - error if not available
+                let addr = self.request_data.client_addr
+                    .ok_or_else(|| AttributeError::NotAvailable("source.address not available: client_addr is None".to_string()))?;
+
+                let (ip, _port) = parse_ip_and_port(addr);
+                Ok(Some(ip.as_bytes().to_vec()))
             }
             "source.port" => {
-                // TODO: Extract from connection metadata
-                // Port as i64 (8 bytes little-endian)
-                let port: i64 = 45000;
-                Ok(Some(port.to_le_bytes().to_vec()))
+                // Try to extract port from client_addr string representation
+                // Format might be "IP:PORT" or just "IP" (default to 80)
+                let addr = self.request_data.client_addr
+                    .ok_or_else(|| AttributeError::NotAvailable("source.port not available: client_addr is None".to_string()))?;
+
+                let (_ip, port) = parse_ip_and_port(addr);
+                let port_i64 = port as i64;
+                Ok(Some(port_i64.to_le_bytes().to_vec()))
             }
             _ => {
                 // Unsupported attribute
