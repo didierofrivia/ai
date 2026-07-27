@@ -16,6 +16,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+/// HTTP reply details from kuadrant-filter's send_http_reply.
+#[derive(Debug, Clone)]
+pub struct HttpReply {
+    pub status_code: u32,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+}
+
 /// Storage for gRPC responses (synchronous bridge for async calls).
 ///
 /// Since `AttributeResolver::dispatch_grpc_call()` is synchronous but we need
@@ -24,11 +32,16 @@ use std::time::Duration;
 /// 2. Store the response here
 /// 3. Return a token_id
 /// 4. `get_grpc_response()` retrieves the stored response
+/// 5. Track tokens that need to be digested by the pipeline
 #[derive(Debug, Default)]
 pub struct GrpcResponseStore {
     responses: HashMap<u32, Vec<u8>>,
     next_token: u32,
     last_token: Option<u32>,
+    /// Tokens that have been stored but not yet digested by the pipeline
+    pending_digest: Vec<u32>,
+    /// HTTP reply to send (set by send_http_reply)
+    reply: Option<HttpReply>,
 }
 
 #[allow(dead_code, reason = "WIP")]
@@ -43,8 +56,29 @@ impl GrpcResponseStore {
         let token = self.next_token;
         self.responses.insert(token, response);
         self.last_token = Some(token);
+        self.pending_digest.push(token);
         self.next_token += 1;
         token
+    }
+
+    /// Get all pending tokens that need to be digested.
+    pub fn take_pending_digest(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.pending_digest)
+    }
+
+    /// Get the size of a stored response.
+    pub fn get_response_size(&self, token: u32) -> Option<usize> {
+        self.responses.get(&token).map(|r| r.len())
+    }
+
+    /// Push a token back into pending digest queue.
+    pub fn push_pending(&mut self, token: u32) {
+        self.pending_digest.push(token);
+    }
+
+    /// Take the HTTP reply, consuming it.
+    pub fn take_reply(&mut self) -> Option<HttpReply> {
+        self.reply.take()
     }
 
     /// Get the last stored response.
@@ -419,8 +453,18 @@ impl AttributeResolver for PraxisAttributeResolver {
         body: Option<&[u8]>,
     ) -> Result<(), ServiceError> {
         use tracing::debug;
-        debug!(status_code, ?headers, body_len = body.map(|b| b.len()), "send_http_reply called");
-        // TODO: Store this to return as the actual HTTP response
+        debug!(status_code, ?headers, body_len = body.map(|b| b.len()), "kuadrant: capturing HTTP reply");
+
+        // Capture the reply details so the filter can return them after pipeline completes
+        self.response_store
+            .write()
+            .expect("response store lock poisoned")
+            .reply = Some(HttpReply {
+                status_code,
+                headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                body: body.map(|b| b.to_vec()),
+            });
+
         Ok(())
     }
 }

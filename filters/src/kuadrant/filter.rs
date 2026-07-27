@@ -106,7 +106,7 @@ impl HttpFilter for KuadrantFilter {
             ctx,
             channel_registry,
             upstreams,
-            response_store,
+            response_store.clone(),  // Clone Arc so we can use it later for digest
         );
 
         // Build ReqRespCtx (same as wasm-shim's new_ctx())
@@ -162,7 +162,46 @@ impl HttpFilter for KuadrantFilter {
                         is_terminated = p.is_terminated(),
                         "kuadrant filter: pipeline in progress, continuing evaluation"
                     );
-                    pipeline = *p;
+
+                    // If the pipeline is paused, check if there's a gRPC response to digest
+                    // We only digest one token at a time, then re-evaluate the pipeline
+                    if p.requires_pause() {
+                        let mut store = response_store
+                            .write()
+                            .expect("response store lock poisoned");
+
+                        let mut pending_tokens = store.take_pending_digest();
+
+                        if let Some(token) = pending_tokens.pop() {
+                            // Put remaining tokens back for next iteration
+                            for remaining_token in pending_tokens {
+                                store.push_pending(remaining_token);
+                            }
+
+                            let response_size = store.get_response_size(token).unwrap_or(0);
+                            drop(store);  // Release lock before digest
+
+                            debug!(token, response_size, "kuadrant: digesting gRPC response");
+
+                            // Digest the response (status 0 = OK)
+                            let digest_state = p.digest(token, 0, response_size);
+                            match digest_state {
+                                kuadrant_filter::kuadrant::pipeline::PipelineState::InProgress(digested) => {
+                                    pipeline = *digested;
+                                }
+                                kuadrant_filter::kuadrant::pipeline::PipelineState::Completed { should_resume } => {
+                                    debug!(should_resume, token, "kuadrant: pipeline completed during digest");
+                                    break should_resume;
+                                }
+                            }
+                        } else {
+                            // No pending responses, just continue with the pipeline
+                            pipeline = *p;
+                        }
+                    } else {
+                        pipeline = *p;
+                    }
+
                     // Loop continues to evaluate again
                 }
                 kuadrant_filter::kuadrant::pipeline::PipelineState::Completed { should_resume } => {
@@ -177,9 +216,37 @@ impl HttpFilter for KuadrantFilter {
             debug!("kuadrant filter: request allowed");
             Ok(FilterAction::Continue)
         } else {
-            debug!("kuadrant filter: request denied by policy");
-            // TODO: Extract proper status code and response from pipeline
-            Err(FilterError::from("Request denied by Kuadrant policy"))
+            // Get the HTTP reply captured during pipeline execution
+            let reply = response_store
+                .write()
+                .expect("response store lock poisoned")
+                .take_reply();
+
+            match reply {
+                Some(r) => {
+                    debug!(status_code = r.status_code, "kuadrant filter: request denied by policy");
+
+                    let mut rejection = praxis_filter::Rejection::status(r.status_code as u16);
+
+                    // Add headers if present
+                    if !r.headers.is_empty() {
+                        for (name, value) in r.headers {
+                            rejection = rejection.with_header(name, value);
+                        }
+                    }
+
+                    // Add body if present
+                    if let Some(body) = r.body {
+                        rejection = rejection.with_body(body);
+                    }
+
+                    Ok(FilterAction::Reject(rejection))
+                }
+                None => {
+                    debug!("kuadrant filter: denied without reply details, using default 403");
+                    Ok(FilterAction::Reject(praxis_filter::Rejection::status(403)))
+                }
+            }
         }
     }
 }
