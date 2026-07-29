@@ -74,6 +74,11 @@ impl GrpcResponseStore {
         std::mem::take(&mut self.pending_digest)
     }
 
+    /// Check if there are pending responses that need to be digested.
+    pub fn has_pending(&self) -> bool {
+        !self.pending_digest.is_empty()
+    }
+
     /// Get the size of a stored response.
     pub fn get_response_size(&self, token: u32) -> Option<usize> {
         self.responses.get(&token).map(|r| r.len())
