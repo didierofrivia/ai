@@ -16,6 +16,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+/// Namespaced storage for pipelines from multiple Kuadrant filter instances.
+///
+/// Key: PipelineFactory pointer address (unique per filter instance)
+/// Value: Stored pipeline from on_request, to be resumed in on_response
+///
+/// Uses Mutex instead of RwLock because Pipeline is Send but not Sync.
+pub type KuadrantPipelineStorage = Arc<std::sync::Mutex<HashMap<usize, kuadrant_filter::kuadrant::pipeline::Pipeline>>>;
+
 /// HTTP reply details from kuadrant-filter's send_http_reply.
 #[derive(Debug, Clone)]
 pub struct HttpReply {
@@ -525,9 +533,20 @@ pub fn initialize_extensions(
     ctx: &mut HttpFilterContext<'_>,
     upstreams: Arc<HashMap<String, UpstreamConfig>>,
 ) {
-    ctx.extensions.insert(Arc::new(GrpcChannelRegistry::new()));
+    // Insert shared extensions only if they don't already exist
+    // (multiple Kuadrant filter instances may call this in different filter chains)
+    if ctx.extensions.get::<Arc<GrpcChannelRegistry>>().is_none() {
+        ctx.extensions.insert(Arc::new(GrpcChannelRegistry::new()));
+    }
+    if ctx.extensions.get::<Arc<RwLock<GrpcResponseStore>>>().is_none() {
+        ctx.extensions.insert(Arc::new(RwLock::new(GrpcResponseStore::new())));
+    }
+    if ctx.extensions.get::<KuadrantPipelineStorage>().is_none() {
+        ctx.extensions.insert(KuadrantPipelineStorage::default());
+    }
+
+    // Always insert upstreams (each filter instance has its own set)
     ctx.extensions.insert(upstreams);
-    ctx.extensions.insert(Arc::new(RwLock::new(GrpcResponseStore::new())));
 }
 
 #[cfg(test)]
