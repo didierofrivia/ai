@@ -124,7 +124,7 @@ impl HttpFilter for KuadrantFilter {
 
         // Use the stored factory to build a pipeline for this request
         // (same pattern as wasm-shim's on_http_request_headers)
-        let mut pipeline = match self.factory.build(req_resp_ctx)
+        let pipeline = match self.factory.build(req_resp_ctx)
             .map_err(|e| FilterError::from(format!("failed to build pipeline: {:?}", e)))? {
             Some(p) => p,
             None => {
@@ -141,84 +141,65 @@ impl HttpFilter for KuadrantFilter {
 
         // Evaluate the pipeline (following wasm-shim pattern)
         // Using requires_pause() to detect when waiting for gRPC responses
-        let mut iteration = 0;
+        debug!(
+            requires_pause = pipeline.requires_pause(),
+            is_terminated = pipeline.is_terminated(),
+            "kuadrant (on_request): evaluating pipeline"
+        );
 
-        let final_action = loop {
-            iteration += 1;
+        let state = pipeline.eval();
 
-            if iteration > 10 {
-                return Err(FilterError::from(
-                    "kuadrant pipeline evaluation exceeded max iterations (likely a bug)"
-                ));
-            }
+        let final_action = match state {
+            kuadrant_filter::kuadrant::pipeline::PipelineState::InProgress(p) => {
+                // Use requires_pause() to determine if waiting for gRPC response
+                if p.requires_pause() {
+                    debug!("kuadrant (on_request): pipeline paused, waiting for gRPC response");
 
-            debug!(
-                iteration,
-                requires_pause = pipeline.requires_pause(),
-                is_terminated = pipeline.is_terminated(),
-                "kuadrant (on_request): evaluating pipeline"
-            );
+                    let mut store = response_store.write().expect("response store lock poisoned");
+                    let pending_token = store.take_pending_digest().pop();
+                    drop(store);
 
-            let state = pipeline.eval();
+                    if let Some(token) = pending_token {
+                        // Got gRPC response - digest it
+                        let response_size = response_store
+                            .read()
+                            .expect("response store lock poisoned")
+                            .get_response_size(token)
+                            .unwrap_or(0);
 
-            match state {
-                kuadrant_filter::kuadrant::pipeline::PipelineState::InProgress(p) => {
-                    // Use requires_pause() to determine if waiting for gRPC response
-                    if p.requires_pause() {
-                        debug!("kuadrant (on_request): pipeline paused, checking for gRPC response");
+                        debug!(token, response_size, "kuadrant (on_request): digesting gRPC response");
 
-                        let mut store = response_store.write().expect("response store lock poisoned");
-                        let pending_token = store.take_pending_digest().pop();
-                        drop(store);
+                        let digest_state = p.digest(token, 0, response_size);
+                        match digest_state {
+                            kuadrant_filter::kuadrant::pipeline::PipelineState::InProgress(digested) => {
+                                // After digest, store pipeline for response phase
+                                let key = Arc::as_ptr(&self.factory) as usize;
+                                let pipeline_storage = ctx
+                                    .extensions
+                                    .get::<super::context::KuadrantPipelineStorage>()
+                                    .expect("KuadrantPipelineStorage not in extensions")
+                                    .clone();
 
-                        if let Some(token) = pending_token {
-                            // Got gRPC response - digest it
-                            let response_size = response_store
-                                .read()
-                                .expect("response store lock poisoned")
-                                .get_response_size(token)
-                                .unwrap_or(0);
+                                pipeline_storage
+                                    .lock()
+                                    .expect("pipeline storage lock poisoned")
+                                    .insert(key, *digested);
 
-                            debug!(token, response_size, "kuadrant (on_request): digesting gRPC response");
-
-                            let digest_state = p.digest(token, 0, response_size);
-                            match digest_state {
-                                kuadrant_filter::kuadrant::pipeline::PipelineState::InProgress(digested) => {
-                                    // After digest, continue evaluating
-                                    pipeline = *digested;
-                                    continue;
-                                }
-                                kuadrant_filter::kuadrant::pipeline::PipelineState::Completed { should_resume } => {
-                                    debug!(should_resume, "kuadrant (on_request): pipeline completed after digest");
-                                    break if should_resume {
-                                        FilterAction::Continue
-                                    } else {
-                                        self.handle_rejection(&response_store)?
-                                    };
+                                debug!(key, "kuadrant (on_request): stored pipeline after digest");
+                                FilterAction::Continue
+                            }
+                            kuadrant_filter::kuadrant::pipeline::PipelineState::Completed { should_resume } => {
+                                debug!(should_resume, "kuadrant (on_request): pipeline completed after digest");
+                                if should_resume {
+                                    FilterAction::Continue
+                                } else {
+                                    self.handle_rejection(&response_store)?
                                 }
                             }
-                        } else {
-                            // Paused but no gRPC response yet - store pipeline for response phase
-                            debug!("kuadrant (on_request): no pending gRPC response, storing pipeline");
-
-                            let key = Arc::as_ptr(&self.factory) as usize;
-                            let pipeline_storage = ctx
-                                .extensions
-                                .get::<super::context::KuadrantPipelineStorage>()
-                                .expect("KuadrantPipelineStorage not in extensions")
-                                .clone();
-
-                            pipeline_storage
-                                .lock()
-                                .expect("pipeline storage lock poisoned")
-                                .insert(key, *p);
-
-                            debug!(key, "kuadrant (on_request): stored pipeline with key");
-                            break FilterAction::Continue;
                         }
                     } else {
-                        // Not paused - shouldn't happen in typical flow, but store anyway
-                        debug!("kuadrant (on_request): pipeline not paused (unexpected), storing");
+                        // Paused but no gRPC response yet - store pipeline for response phase
+                        debug!("kuadrant (on_request): no pending gRPC response, storing pipeline");
 
                         let key = Arc::as_ptr(&self.factory) as usize;
                         let pipeline_storage = ctx
@@ -232,16 +213,34 @@ impl HttpFilter for KuadrantFilter {
                             .expect("pipeline storage lock poisoned")
                             .insert(key, *p);
 
-                        break FilterAction::Continue;
-                    }
-                }
-                kuadrant_filter::kuadrant::pipeline::PipelineState::Completed { should_resume } => {
-                    debug!(should_resume, "kuadrant (on_request): pipeline completed");
-                    break if should_resume {
+                        debug!(key, "kuadrant (on_request): stored pipeline with key");
                         FilterAction::Continue
-                    } else {
-                        self.handle_rejection(&response_store)?
-                    };
+                    }
+                } else {
+                    // Not paused - store pipeline for response phase
+                    debug!("kuadrant (on_request): pipeline not paused, storing for response phase");
+
+                    let key = Arc::as_ptr(&self.factory) as usize;
+                    let pipeline_storage = ctx
+                        .extensions
+                        .get::<super::context::KuadrantPipelineStorage>()
+                        .expect("KuadrantPipelineStorage not in extensions")
+                        .clone();
+
+                    pipeline_storage
+                        .lock()
+                        .expect("pipeline storage lock poisoned")
+                        .insert(key, *p);
+
+                    FilterAction::Continue
+                }
+            }
+            kuadrant_filter::kuadrant::pipeline::PipelineState::Completed { should_resume } => {
+                debug!(should_resume, "kuadrant (on_request): pipeline completed");
+                if should_resume {
+                    FilterAction::Continue
+                } else {
+                    self.handle_rejection(&response_store)?
                 }
             }
         };
@@ -369,72 +368,48 @@ impl HttpFilter for KuadrantFilter {
             // Evaluate the pipeline after setting response body context
             // (same pattern as wasm-shim on_http_response_body)
             // Now responseBodyJSON() expressions can read the values we set
-            let mut pipeline = pipeline;
-            let mut iteration = 0;
+            debug!(
+                requires_pause = pipeline.requires_pause(),
+                is_terminated = pipeline.is_terminated(),
+                "kuadrant (on_response_body): evaluating pipeline"
+            );
 
-            loop {
-                iteration += 1;
+            let state = pipeline.eval();
 
-                if iteration > 10 {
-                    return Err(FilterError::from("on_response_body pipeline exceeded max iterations"));
-                }
+            match state {
+                kuadrant_filter::kuadrant::pipeline::PipelineState::InProgress(p) => {
+                    // Use requires_pause() to detect if waiting for gRPC (report-service task)
+                    if p.requires_pause() {
+                        debug!("kuadrant (on_response_body): pipeline paused, checking for gRPC response");
 
-                debug!(
-                    iteration,
-                    requires_pause = pipeline.requires_pause(),
-                    is_terminated = pipeline.is_terminated(),
-                    "kuadrant (on_response_body): evaluating pipeline"
-                );
+                        let mut store = response_store.write().expect("response store lock poisoned");
+                        let pending_token = store.take_pending_digest().pop();
+                        drop(store);
 
-                let state = pipeline.eval();
+                        if let Some(token) = pending_token {
+                            // Got gRPC response - digest it
+                            let response_size = response_store
+                                .read()
+                                .expect("response store lock poisoned")
+                                .get_response_size(token)
+                                .unwrap_or(0);
 
-                match state {
-                    kuadrant_filter::kuadrant::pipeline::PipelineState::InProgress(p) => {
-                        // Use requires_pause() to detect if waiting for gRPC (report-service task)
-                        if p.requires_pause() {
-                            debug!("kuadrant (on_response_body): pipeline paused, checking for gRPC response");
+                            debug!(token, response_size, "kuadrant (on_response_body): digesting gRPC response");
 
-                            let mut store = response_store.write().expect("response store lock poisoned");
-                            let pending_token = store.take_pending_digest().pop();
-                            drop(store);
-
-                            if let Some(token) = pending_token {
-                                // Got gRPC response - digest it
-                                let response_size = response_store
-                                    .read()
-                                    .expect("response store lock poisoned")
-                                    .get_response_size(token)
-                                    .unwrap_or(0);
-
-                                debug!(token, response_size, "kuadrant (on_response_body): digesting gRPC response");
-
-                                let digest_state = p.digest(token, 0, response_size);
-                                match digest_state {
-                                    kuadrant_filter::kuadrant::pipeline::PipelineState::InProgress(digested) => {
-                                        // After digest, continue evaluating
-                                        pipeline = *digested;
-                                        continue;
-                                    }
-                                    kuadrant_filter::kuadrant::pipeline::PipelineState::Completed { .. } => {
-                                        debug!("kuadrant (on_response_body): pipeline completed after digest");
-                                        break;
-                                    }
-                                }
-                            } else {
-                                // Paused but no gRPC response yet - shouldn't happen, but break anyway
-                                debug!("kuadrant (on_response_body): paused but no pending gRPC response");
-                                break;
-                            }
+                            // Digest and we're done (report-service is fire-and-forget)
+                            let _digest_state = p.digest(token, 0, response_size);
+                            debug!("kuadrant (on_response_body): digest complete");
                         } else {
-                            // Not paused - pipeline completed its work
-                            debug!("kuadrant (on_response_body): pipeline not paused, done");
-                            break;
+                            // Paused but no gRPC response yet - shouldn't happen
+                            debug!("kuadrant (on_response_body): paused but no pending gRPC response");
                         }
+                    } else {
+                        // Not paused - pipeline completed its work
+                        debug!("kuadrant (on_response_body): pipeline not paused, done");
                     }
-                    kuadrant_filter::kuadrant::pipeline::PipelineState::Completed { .. } => {
-                        debug!("kuadrant (on_response_body): pipeline completed");
-                        break;
-                    }
+                }
+                kuadrant_filter::kuadrant::pipeline::PipelineState::Completed { .. } => {
+                    debug!("kuadrant (on_response_body): pipeline completed");
                 }
             }
         } else {
